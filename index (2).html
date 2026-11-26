@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Eye → Space</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#010203;color:#fff}
+  body{display:grid;place-items:center;font-family:Consolas,"Courier New",monospace}
+  #stage{width:min(100vw,140vh);height:min(71.43vw,100vh);display:grid;place-items:center}
+  canvas{width:100%;height:100%;display:block}
+  #hint{position:fixed;right:12px;bottom:9px;color:#687080;font:11px system-ui;opacity:.7}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c"></canvas></div>
+<div id="hint">R — начать заново · Space — пауза</div>
+<script>
+(() => {
+"use strict";
+// Прямой порт eye.py (numpy) на JS: тот же сценарий, те же формулы.
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', {alpha:false});
+
+const FPS = 30, SS = 2, ASPECT = 1.40;
+const ROWS = 30, COLS = 76;               // сетка символов (как MAXROWS в питоне)
+const GW = COLS*SS, GH = ROWS*SS;
+const CHW = COLS/(ROWS*ASPECT);           // высота ячейки / ширина ячейки
+
+const T_OPEN=0.9, T_OPEN_D=2.4, T_BLINK=4.0, T_Z0=5.4, T_ZD=28.0, ZEND=14.0;
+const T_SPACE=T_Z0+T_ZD, T_HEART=T_Z0+3.5, T_HEART_D=26.0;
+const WO=0.78, HU=0.30, HL=0.20, RI=0.27, RP0=0.098, GS0=0.085;
+
+const RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$";
+const NR = RAMP.length-1, QL = 24;
+const CIDX = {}; for (let i=0;i<RAMP.length;i++) if(!(RAMP[i] in CIDX)) CIDX[RAMP[i]]=i;
+
+// ---------- утилиты ----------
+let rs = 5>>>0;
+function rand(){rs=(rs+0x6D2B79F5)>>>0;let t=rs;t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296}
+const uni=(a,b)=>a+(b-a)*rand();
+const clamp=(x,a=0,b=1)=>x<a?a:x>b?b:x;
+const ss=(a,b,x)=>{const t=clamp((x-a)/(b-a));return t*t*(3-2*t)};
+const ease=x=>{x=clamp(x);return x*x*(3-2*x)};
+const mix=(a,b,k)=>a+(b-a)*k;
+const sq=x=>x*x;
+
+// ---------- текстуры ----------
+function up2(b,g,n){
+  const i0=new Int32Array(n),i1=new Int32Array(n),f=new Float32Array(n);
+  for(let k=0;k<n;k++){const idx=k*g/n,fl=Math.floor(idx);i0[k]=fl%g;i1[k]=(i0[k]+1)%g;const ff=idx-fl;f[k]=ff*ff*(3-2*ff)}
+  const t=new Float32Array(g*n);
+  for(let r=0;r<g;r++)for(let k=0;k<n;k++)t[r*n+k]=b[r*g+i0[k]]*(1-f[k])+b[r*g+i1[k]]*f[k];
+  const out=new Float32Array(n*n);
+  for(let j=0;j<n;j++){const a=i0[j]*n,c=i1[j]*n,fj=f[j];for(let k=0;k<n;k++)out[j*n+k]=t[a+k]*(1-fj)+t[c+k]*fj}
+  return out;
+}
+function norm(a,k=4.0){
+  let m=0;for(let i=0;i<a.length;i++)m+=a[i];m/=a.length;
+  let v=0;for(let i=0;i<a.length;i++)v+=sq(a[i]-m);const sd=Math.sqrt(v/a.length);
+  const o=new Float32Array(a.length);
+  for(let i=0;i<a.length;i++)o[i]=clamp(.5+(a[i]-m)/(sd*k+1e-9));
+  return o;
+}
+function tex2d(n,grids){
+  const out=new Float32Array(n*n);let amp=1;
+  for(const g of grids){
+    const b=new Float32Array(g*g);for(let i=0;i<b.length;i++)b[i]=rand();
+    const u=up2(b,g,n);for(let i=0;i<out.length;i++)out[i]+=amp*u[i];amp*=.55;
+  }
+  return norm(out);
+}
+function noise1d(n,g){
+  const base=new Float32Array(g);for(let i=0;i<g;i++)base[i]=rand();
+  const o=new Float32Array(n);
+  for(let k=0;k<n;k++){const idx=k*g/n,fl=Math.floor(idx),i0=fl%g,i1=(i0+1)%g;let f=idx-fl;f=f*f*(3-2*f);o[k]=base[i0]*(1-f)+base[i1]*f}
+  return o;
+}
+function bil(tex,n,u,v){
+  const u0=Math.floor(u),v0=Math.floor(v),fu=u-u0,fv=v-v0;
+  const i0=((u0%n)+n)%n,j0=((v0%n)+n)%n,i1=(i0+1)%n,j1=(j0+1)%n;
+  return (tex[j0*n+i0]*(1-fu)+tex[j0*n+i1]*fu)*(1-fv)+(tex[j1*n+i0]*(1-fu)+tex[j1*n+i1]*fu)*fv;
+}
+
+const TS=tex2d(1024,[6,20,64,200]);
+const TG=tex2d(1024,[8,24,64,160]);
+const TW=new Float32Array(512*512);for(let i=0;i<TW.length;i++)TW[i]=rand();
+const TV=(()=>{const t=tex2d(512,[5,12,30]);for(let i=0;i<t.length;i++)t[i]=1-Math.abs(2*t[i]-1);return t})();
+const TV2=(()=>{const t=tex2d(512,[3,7,16]);for(let i=0;i<t.length;i++)t[i]=1-Math.abs(2*t[i]-1);return t})();
+
+const NA=4096;
+function comb(ws,gs,k){const parts=gs.map(g=>noise1d(NA,g));const o=new Float32Array(NA);for(let i=0;i<NA;i++){let s=0;for(let j=0;j<ws.length;j++)s+=ws[j]*parts[j][i];o[i]=s}return norm(o,k)}
+const A1=comb([.5,.3,.2],[900,300,120],3);
+const A2=comb([.5,.3,.2],[700,200,80],3);
+const A3=norm(noise1d(NA,13),3);
+const A4=norm(noise1d(NA,48),3);
+
+// ---------- звёзды ----------
+const NS=3200;
+const SX=new Float32Array(NS),SY=new Float32Array(NS),SD=new Float32Array(NS),SB=new Float32Array(NS);
+const SCOL=new Float32Array(NS*3),SPH=new Float32Array(NS),SF=new Float32Array(NS);
+for(let i=0;i<NS;i++){SX[i]=uni(-1,1)}
+for(let i=0;i<NS;i++){SY[i]=uni(-1,1)}
+for(let i=0;i<NS;i++){SD[i]=uni(.06,1)}
+for(let i=0;i<NS;i++){SB[i]=.10+.90*Math.pow(rand(),3.5)}
+for(let i=0;i<NS;i++){const k=Math.pow(rand(),1.5);SCOL[i*3]=mix(.70,1.0,k);SCOL[i*3+1]=mix(.82,.80,k);SCOL[i*3+2]=mix(1.0,.55,k)}
+for(let i=0;i<NS;i++){SPH[i]=uni(0,6.28)}
+for(let i=0;i<NS;i++){SF[i]=uni(1,3.5)}
+
+// ---------- взгляд, ресницы ----------
+const GZ=[[0,0,0]];
+{let tc=1.7;while(tc<40){GZ.push([tc,uni(-.045,.045),uni(-.022,.02)]);tc+=uni(.9,2.4)}}
+const UP_L=[],LO_L=[];
+for(let i=0;i<44;i++)UP_L.push([-0.92+1.84*i/43,uni(.92,1.08)]);
+for(let i=0;i<20;i++)LO_L.push([-0.70+1.40*i/19,uni(.90,1.10)]);
+
+// ---------- геометрия сетки ----------
+const XA=new Float32Array(GW*GH),YA=new Float32Array(GW*GH),RSA=new Float32Array(GW*GH);
+for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){const p=y*GW+x;XA[p]=((x+.5)/GW-.5)*ASPECT;YA[p]=(y+.5)/GH-.5;RSA[p]=Math.hypot(XA[p],YA[p])}
+const RSC=new Float32Array(COLS*ROWS),HSC=new Float32Array(COLS*ROWS);
+for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+  const X=((c+.5)/COLS-.5)*ASPECT,Y=(r+.5)/ROWS-.5;RSC[r*COLS+c]=Math.hypot(X,Y);
+  const h=(Math.imul(r,73856093)^Math.imul(c,19349663)^0x5bd1e995)>>>0;HSC[r*COLS+c]=(h%1009)/1009;
+}
+
+// ---------- время ----------
+function blinkC(t){const d=t-T_BLINK;if(d<0||d>.36)return 0;if(d<.09)return ease(d/.09);if(d<.12)return 1;return 1-ease((d-.12)/.24)}
+function lidOpen(t){let k=ease((t-T_OPEN)/T_OPEN_D);k*=1+.035*Math.sin(Math.PI*k);return Math.min(1,k)*(1-.985*blinkC(t))}
+function gaze(t){
+  let prev=[0,0],cur=[0,0],te=0;
+  for(const [tt,x,y] of GZ){if(tt<=t){prev=cur;cur=[x,y];te=tt}else break}
+  const k=ease((t-te)/.09);
+  let gx=prev[0]+(cur[0]-prev[0])*k,gy=prev[1]+(cur[1]-prev[1])*k;
+  gx+=.003*Math.sin(t*1.3);gy+=.002*Math.sin(t*1.1+1);
+  const amp=1-ease((t-T_Z0)/2.5);gy-=.03*blinkC(t);
+  return [gx*amp,gy*amp];
+}
+function lidEdges(u0,ou){
+  const s=u0/WO,wu=s<-.12?.88:1.12;
+  const cu=Math.pow(Math.max(0,1-sq((s+.12)/wu)),.8),cl=Math.pow(Math.max(0,1-sq(s-.08)),.9);
+  const vc=.03*cl,vl=vc+(HL*cl-vc)*(.35+.65*ou),vu=vl+(-HU*cu-vl)*ou;
+  return [vu,vl,cu,cl];
+}
+
+// ---------- туманность-сердце ----------
+const HN=[0,0,0];
+function heartNebula(xs,ys,sz,hm,t){
+  const hx=xs/sz,hy=-ys/sz;
+  const nC=bil(TG,1024,hx*16+400,hy*16+100),nD=bil(TG,1024,hx*16+90,hy*16+530);
+  const nA=bil(TG,1024,hx*42+300,hy*42+700+t*.8),nB=bil(TG,1024,hx*110+80,hy*110+200);
+  const wob=1-.65*hm;
+  const hxw=hx+wob*.40*(nC-.5)+.05*(nA-.5),hyw=hy+wob*.40*(nD-.5)+.05*(nA-.5);
+  const qc=Math.sqrt(hxw*hxw+hyw*hyw)/.80-1;
+  const hyh=hyw+.12,fh=Math.pow(hxw*hxw+hyh*hyh-1,3)-hxw*hxw*hyh*hyh*hyh;
+  const qh=.5*Math.cbrt(fh);
+  const q=qc*(1-hm)+qh*hm;
+  const ins=clamp(-q/(.80-.35*hm));
+  const k=3+2.5*hm;
+  const body=q<0?.5+.5*Math.sqrt(ins):Math.exp(-clamp(q,0,10)*k)*.5;
+  const tex=1+(.62+.80*nB-1)*.8;
+  const ki=Math.pow(ins,.8),bt=body*tex;
+  let r=bt*mix(.92,1.0,ki),g=bt*mix(.16,.58,ki),b=bt*mix(.40,.78,ki);
+  const halo=q>0?Math.exp(-clamp(q,0,10)*1.6)*.20*(.5+nA):0;
+  r+=halo*.78;g+=halo*.10;b+=halo*.30;
+  const rim=Math.exp(-sq((q+.04)/.14));
+  const rid=clamp((bil(TV,512,hxw*120+50,hyw*120+300+t*.6)-.86)*7);
+  const a1=rim*(.20+.9*rid)*(.5+nA),a2=rid*clamp(-q,0,1)*.25,aa=a1+a2;
+  r+=aa*.95;g+=aa*.16;b+=aa*.34;
+  HN[0]=r;HN[1]=g;HN[2]=b;
+}
+
+// ---------- сцена глаза ----------
+const SP=new Float32Array(GW*GH*3),IMG=new Float32Array(GW*GH*3),PM=new Float32Array(GW*GH);
+function eyeScene(t,z,ou,gx,gy,Rp){
+  const iz=1/z,px=iz/GH,near=z<3.4,Rps=Rp*z;
+  const fadeC=clamp(1-(z-1.6)/2.4);
+  for(let p=0;p<GW*GH;p++){
+    const X=XA[p],Y=YA[p],u=X*iz,v=Y*iz,pu=u-gx,pv=v-gy,r=Math.hypot(pu,pv);
+    let s=0,vt=0,vu=0,vl=0,du_in=0,dl_in=0,m_in=0;
+    if(near){
+      s=u/WO;const sa=clamp(s,-1.3,1.3),wu=sa<-.12?.88:1.12;
+      const cu=Math.pow(clamp(1-sq((sa+.12)/wu)),.8),cl=Math.pow(clamp(1-sq(sa-.08)),.9);
+      vt=v+.055*s;const vc=.03*cl;
+      vl=vc+(HL*cl-vc)*(.35+.65*ou);vu=vl+(-HU*cu-vl)*ou;
+      du_in=vt-vu;dl_in=vl-vt;m_in=clamp(Math.min(du_in,dl_in)/(1.6*px)+.5);
+    }
+    const ang=(((Math.atan2(pv,pu)/(2*Math.PI))%1)+1)%1;
+    const ia=Math.floor(ang*NA)%NA;
+    const rn=clamp((r-Rp)/(RI-Rp),0,1.3),rb=rn*14,i0=Math.floor(rb),fr=rb-i0;
+    const fib=.55*A1[ia]+.45*(A2[(ia+i0*131)%NA]*(1-fr)+A2[(ia+(i0+1)*131)%NA]*fr);
+    const zig=Math.abs((ang*34)%1-.5)*2-.5;
+    const cr=.34+.20*(A3[ia]-.5)+.035*zig;
+    const mm=ss(-.10,.22,rn-cr);
+    const bright=.45+1.05*fib;
+    let ir0=mix(.22,.10,mm)*bright,ir1=mix(.78,.42,mm)*bright,ir2=mix(.16,.08,mm)*bright;
+    const ring=Math.exp(-sq((rn-cr)/.07))*(.2+fib);
+    ir0+=.08*ring;ir1+=.22*ring;ir2+=.04*ring;
+    const cry=(A4[ia]>.72?1:0)*ss(.65,.18,rn);
+    let f=(1-.55*cry)*(1-.82*ss(.62,1.0,rn))*(.55+.45*ss(0,.07,rn));
+    if(near)f*=.30+.70*ss(0,.16,du_in);
+    ir0*=f;ir1*=f;ir2*=f;
+
+    let c0,c1,c2,skin0=0,skin1=0,skin2=0,cw=0,sh=0;
+    if(near){
+      cw=ss(.40,.95,Math.abs(s));
+      sh=(.38+.62*ss(0,.22,du_in))*(.72+.28*ss(0,.10,dl_in))*(1-.30*cw);
+      skin0=mix(.80*sh,.86*sh,cw*.35);skin1=mix(.82*sh,.50*sh,cw*.35);skin2=mix(.86*sh,.46*sh,cw*.35);
+      const vein=clamp((bil(TV2,512,u*85+40,v*85+70)-.925)*14)*(.25+.75*cw)*ss(.12,.32,Math.abs(pu));
+      skin0=mix(skin0,.62,vein*.65);skin1=mix(skin1,.15,vein*.65);skin2=mix(skin2,.14,vein*.65);
+      const im=clamp((RI-r)/(1.6*px)+.5);
+      c0=mix(skin0,ir0,im);c1=mix(skin1,ir1,im);c2=mix(skin2,ir2,im);
+    }else{c0=ir0;c1=ir1;c2=ir2}
+
+    const vig=.25+.75*ss(0,.30*Rps,Rps-RSA[p]);
+    const pm=clamp((Rp-r)/(1.6*px)+.5);
+    c0=mix(c0,SP[p*3]*vig,pm);c1=mix(c1,SP[p*3+1]*vig,pm);c2=mix(c2,SP[p*3+2]*vig,pm);
+
+    if(fadeC>0){
+      const dd=Math.hypot(pu-.075,pv+.040),win=clamp(1-(dd-.030)/(1.4*px+.004));
+      const dd2=Math.hypot(pu+.045,pv-.050),win2=clamp(1-(dd2-.009)/(1.4*px+.003))*.5;
+      const w=(win+win2)*fadeC*1.4;
+      c0+=w;c1+=w*.98;c2+=w*.95;
+    }
+
+    PM[p]=pm;
+    if(near&&z<2.6){
+      const mid=.5*(vu+vl),upper=vt<mid;
+      const du=Math.max(vu-vt,0),dl=Math.max(vt-vl,0),dd=upper?du:dl;
+      const tx=bil(TS,1024,u*120+100,v*120+100);
+      const bm=.90+.20*tx;
+      let k0=.62*bm,k1=.40*bm,k2=.29*bm;
+      let sh2=.50+.50*ss(0,.30,dd);
+      sh2*=1+.10*Math.exp(-sq((v+.20)/.09));
+      const crp=.075+.03*(1-ou);
+      if(upper)sh2*=1-.42*Math.exp(-sq((du-crp)/.020));
+      else sh2*=1+.08*Math.exp(-sq((dl-.09)/.04));
+      k0*=sh2;k1*=sh2;k2*=sh2;
+      const lz=upper?ss(crp,crp*.4,du):0;
+      k0=mix(k0,.68*sh2,lz*.5);k1=mix(k1,.40*sh2,lz*.5);k2=mix(k2,.31*sh2,lz*.5);
+      const sb=clamp(1-Math.abs(s));
+      const eb=Math.exp(-sq((vt+.42+.10*s*s)/(.040+.012*sb)));
+      const hair=.55+.9*bil(TW,512,u*90,v*30),he=clamp(eb*hair,0,.92);
+      k0=mix(k0,.10,he);k1=mix(k1,.06,he);k2=mix(k2,.04,he);
+      const line=upper?Math.exp(-sq(du/.010)):0,la=clamp(line*(1-.3*ou)*.9);
+      k0=mix(k0,.05,la);k1=mix(k1,.03,la);k2=mix(k2,.022,la);
+      const wl=upper?0:ss(.014,0,dl);
+      k0=mix(k0,.74,wl*.7);k1=mix(k1,.34,wl*.7);k2=mix(k2,.30,wl*.7);
+      if(!upper){
+        const gl=Math.exp(-sq((dl-.016)/.006))*(.35+.65*bil(TW,512,u*60,v*60))*ss(.12,.5,ou)*.55;
+        k0+=gl;k1+=gl*.85;k2+=gl*.75;
+      }
+      const spk=(bil(TW,512,u*150+7,v*150+3)>.985?1:0)*.35*(.4+tx)*ss(0,.3,dd);
+      k0+=spk;k1+=spk*.9;k2+=spk*.8;
+      c0=mix(k0,c0,m_in);c1=mix(k1,c1,m_in);c2=mix(k2,c2,m_in);
+      const cg=Math.exp(-(sq((u+WO*.90)/.045)+sq((vt-.025)/.032)))*ss(.1,.5,ou)*.85;
+      c0=mix(c0,.82,cg);c1=mix(c1,.42,cg);c2=mix(c2,.38,cg);
+    }
+    IMG[p*3]=c0;IMG[p*3+1]=c1;IMG[p*3+2]=c2;
+  }
+}
+
+// ---------- bloom ----------
+function bloom(img){
+  const n=GW*GH,b=new Float32Array(n*3);
+  for(let i=0;i<n*3;i++)b[i]=Math.max(0,img[i]-.45);
+  for(const [f,w] of [[2,.40],[4,.30]]){
+    const gh=GH/f,gw=GW/f;let s=new Float32Array(gh*gw*3);
+    for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){const o=((y/f|0)*gw+(x/f|0))*3,p=(y*GW+x)*3;s[o]+=b[p];s[o+1]+=b[p+1];s[o+2]+=b[p+2]}
+    const inv=1/(f*f);for(let i=0;i<s.length;i++)s[i]*=inv;
+    for(let it=0;it<2;it++){
+      const s2=new Float32Array(s.length);
+      for(let y=0;y<gh;y++)for(let x=0;x<gw;x++)for(let c=0;c<3;c++){
+        const yu=(y+gh-1)%gh,yd=(y+1)%gh,xl=(x+gw-1)%gw,xr=(x+1)%gw;
+        s2[(y*gw+x)*3+c]=(s[(y*gw+x)*3+c]*2+s[(yu*gw+x)*3+c]+s[(yd*gw+x)*3+c]+s[(y*gw+xl)*3+c]+s[(y*gw+xr)*3+c])/6;
+      }
+      s=s2;
+    }
+    for(let y=0;y<GH;y++)for(let x=0;x<GW;x++){const o=((y/f|0)*gw+(x/f|0))*3,p=(y*GW+x)*3;img[p]+=w*s[o];img[p+1]+=w*s[o+1];img[p+2]+=w*s[o+2]}
+  }
+}
+
+// ---------- мир: звёзды, метеоры, комета ----------
+let streaks=[];
+const S={last:0,nextShoot:1e9,comet:false};
+function reset(){
+  S.last=0;S.nextShoot=1e9;S.comet=false;streaks=[];
+  for(let i=0;i<NS;i++)SD[i]=uni(.06,1);
+}
+function updateWorld(t,dt,prog){
+  const vf=.010+.05*prog+(t>T_SPACE?.015:0);
+  for(let i=0;i<NS;i++){SD[i]-=vf*dt;if(SD[i]<.06){SD[i]+=.94;SX[i]=uni(-1,1);SY[i]=uni(-1,1)}}
+  if(S.nextShoot>1e8&&t>T_SPACE-4)S.nextShoot=t+1;
+  if(t>S.nextShoot){
+    S.nextShoot=t+uni(2.2,4.5);
+    const a=uni(18,62)*Math.PI/180,sg=rand()<.5?-1:1,sp=uni(.7,1.2);
+    streaks.push({x:uni(-.7,.7),y:uni(-.45,-.15),vx:sg*Math.cos(a)*sp,vy:Math.sin(a)*sp,life:uni(.9,1.4),tail:uni(.14,.26),col:[.88,.94,1],soft:false,age:0});
+  }
+  if(t>T_SPACE+1.5&&!S.comet){S.comet=true;streaks.push({x:-.95,y:-.28,vx:.030,vy:.008,life:70,tail:.22,col:[.70,.86,1],soft:true,age:0})}
+  for(const s of streaks)s.age+=dt;
+  streaks=streaks.filter(s=>s.age<s.life);
+}
+
+// ---------- штампы символов ----------
+const IDX=new Int32Array(ROWS*COLS),FG=new Float32Array(ROWS*COLS*3),PMC=new Float32Array(ROWS*COLS),VIGC=new Float32Array(ROWS*COLS),LUM=new Float32Array(ROWS*COLS);
+function put(r,c,ch,col,a){if(r>=0&&r<ROWS&&c>=0&&c<COLS){const o=r*COLS+c;IDX[o]=CIDX[ch];FG[o*3]=col[0]*a;FG[o*3+1]=col[1]*a;FG[o*3+2]=col[2]*a}}
+
+function stampStars(t,gs,amt,offx,offy){
+  if(amt<=.003)return;
+  const sel=[];
+  for(let i=0;i<NS;i++){
+    const d=SD[i];
+    const c=Math.trunc(COLS*(.5+(SX[i]*gs/d+offx)/ASPECT)),r=Math.trunc(ROWS*(.5+SY[i]*gs/d+offy));
+    if(c<0||c>=COLS||r<0||r>=ROWS)continue;
+    const alpha=ss(1.0,.82,d)*(.80+.20*Math.sin(t*SF[i]+SPH[i]))*amt;
+    if(alpha<=.04)continue;
+    const o=r*COLS+c;
+    if(PMC[o]<=.5)continue;
+    const b=SB[i]*alpha*(1+.05/d);
+    if(b<=LUM[o]*.7)continue;
+    sel.push([i,r,c,b]);
+  }
+  for(const [i,r,c,b] of sel){
+    const o=r*COLS+c;
+    IDX[o]=b<.20?CIDX['.']:b<.42?CIDX['+']:CIDX['*'];
+    const k=clamp(.35+.9*b)*VIGC[o];
+    FG[o*3]=SCOL[i*3]*k;FG[o*3+1]=SCOL[i*3+1]*k;FG[o*3+2]=SCOL[i*3+2]*k;
+  }
+  let nb=0;
+  for(const [i,r,c,bb] of sel){
+    if(bb<=.55)continue;if(nb++>=40)break;
+    const o=r*COLS+c,v=VIGC[o],col=[SCOL[i*3]*v,SCOL[i*3+1]*v,SCOL[i*3+2]*v];
+    IDX[o]=bb>.85?CIDX['@']:CIDX['*'];
+    const ln=Math.trunc(2+6*(bb-.5));
+    for(let k=1;k<=ln;k++){
+      const a=(1-k/(ln+1))*bb,kk=(k>>1)+(k>2?1:0);
+      for(const [dr,dc,chh] of [[0,k,'-'],[0,-k,'-'],[kk,0,'|'],[-kk,0,'|']]){
+        if(dr===0&&dc===0)continue;
+        const r2=r+dr,c2=c+dc;
+        if(r2>=0&&r2<ROWS&&c2>=0&&c2<COLS&&PMC[r2*COLS+c2]>.5&&LUM[r2*COLS+c2]<a*.8){
+          const o2=r2*COLS+c2;IDX[o2]=CIDX[a>.18?chh:'.'];
+          const m=Math.min(1,.25+a);FG[o2*3]=col[0]*m;FG[o2*3+1]=col[1]*m;FG[o2*3+2]=col[2]*m;
+        }
+      }
+    }
+  }
+}
+function stampStreak(s){
+  const hx=s.x+s.vx*s.age,hy=s.y+s.vy*s.age,sp=Math.hypot(s.vx,s.vy),dx=s.vx/sp,dy=s.vy/sp;
+  const fade=Math.pow(Math.sin(Math.PI*Math.min(1,s.age/s.life)),.7);
+  if(!(fade>=.02))return;
+  let tc;
+  if(Math.abs(dy)<.38*Math.abs(dx))tc='-';
+  else if(Math.abs(dx)<.38*Math.abs(dy))tc='|';
+  else if(dx*dy>0)tc='\\';else tc='/';
+  const n=Math.max(6,Math.trunc(s.tail*ROWS*CHW/.8));
+  for(let k=0;k<n;k++){
+    const f=k/n;
+    const c=Math.trunc(COLS*(.5+(hx-dx*s.tail*f)/ASPECT)),r=Math.trunc(ROWS*(.5+hy-dy*s.tail*f));
+    const b=Math.pow(1-f,1.3)*fade;
+    if(b<.08||r<0||r>=ROWS||c<0||c>=COLS||PMC[r*COLS+c]<.5)continue;
+    let ch;
+    if(k===0)ch=s.soft?'*':'@';
+    else if(s.soft)ch=b>.35?':':'.';
+    else ch=b>.30?tc:'.';
+    put(r,c,ch,s.col,Math.min(1,.3+b)*VIGC[r*COLS+c]);
+  }
+}
+function stampLashes(z,ou){
+  if(z>2.6||ou<0)return;
+  const cl=1-Math.pow(ou,.8);
+  const toCell=(ue,ve)=>[Math.trunc(COLS*(.5+ue*z/ASPECT)),Math.trunc(ROWS*(.5+ve*z))];
+  const pick=aa=>{const ang=((Math.atan2(-Math.sin(aa),Math.cos(aa))*180/Math.PI)%180+180)%180;
+    if(ang<25||ang>=155)return'-';if(ang<70)return'/';if(ang<110)return'|';return'\\'};
+  const draw=(bu,bv,a0,L,curl,cr,ct,nmax,tip)=>{
+    const n=Math.trunc(Math.max(2,Math.min(nmax,L*z*ROWS*CHW/.85))),step=L/n;
+    let ue=bu,ve=bv;
+    for(let k=0;k<n;k++){
+      const tt=k/Math.max(1,n-1),aa=a0+curl*tt*tt;
+      ue+=Math.cos(aa)*step;ve+=Math.sin(aa)*step;
+      const [c,r]=toCell(ue,ve);
+      if(r<0||r>=ROWS||c<0||c>=COLS)continue;
+      const ch=(k===n-1&&n>=4)?tip:pick(aa),o=r*COLS+c;
+      IDX[o]=CIDX[ch];
+      FG[o*3]=cr[0]+(ct[0]-cr[0])*tt;FG[o*3+1]=cr[1]+(ct[1]-cr[1])*tt;FG[o*3+2]=cr[2]+(ct[2]-cr[2])*tt;
+    }
+  };
+  const upR=[.16,.10,.07],upT=[.30,.19,.13],loR=[.17,.11,.08],loT=[.30,.20,.14];
+  const rad=d=>d*Math.PI/180;
+  for(const [s0,lf] of UP_L){
+    const u0=s0*WO,[vu]=lidEdges(u0,ou),bv=vu-.055*s0;
+    const aOpen=rad(-90+26*s0),aClosed=s0>=0?rad(90-20*s0):rad(-270-20*s0);
+    const a0=aOpen+(aClosed-aOpen)*cl;
+    const edge=Math.sqrt(Math.max(0,1-s0*s0)),Lh=(.070+.050*edge)*lf,curl=rad(-22*s0)*(1-cl);
+    draw(u0,bv,a0,Lh,curl,upR,upT,14,"'");
+  }
+  for(const [s0,lf] of LO_L){
+    const u0=s0*WO,[,vl,,cl_]=lidEdges(u0,ou),bv=vl-.055*s0;
+    const a0=rad(90-20*s0),Lh=.034*(.5+.8*cl_)*lf;
+    draw(u0,bv,a0,Lh,rad(12*(s0>0?1:-1)),loR,loT,6,".");
+  }
+}
+
+// ---------- кадр ----------
+const CELL=new Float32Array(ROWS*COLS*3);
+function renderCells(t,dt){
+  S.last=t;
+  const prog=ease((t-T_Z0)/T_ZD),idle=ease(t/T_Z0);
+  const z=Math.exp(Math.log(ZEND)*prog)*(1+.05*idle+.004*Math.sin(t*.9));
+  const zsp=t<T_SPACE?z:ZEND*Math.exp(.03*(t-T_SPACE));
+  const gs=Math.min(6,GS0*Math.pow(zsp,1.25)),gh=Math.min(1.15,GS0*Math.pow(z,1.25));
+  const ou=lidOpen(t),[gx,gy]=gaze(t);
+  const Rp=RP0*(.76+.24*ease((t-1.8)/3.5))*(1+.025*Math.sin(1.9*t))*(1+.30*prog);
+  const Rps=Rp*z,full=Rps*.72>1.03;
+  const starAmt=ease((t-(T_Z0+1.5))/4.5),nebAmt=ease((t-(T_Z0+3.5))/8);
+  updateWorld(t,dt,prog);
+
+  const offx=gx*z,offy=gy*z;
+  for(let i=0;i<GW*GH;i++){SP[i*3]=.004;SP[i*3+1]=.005;SP[i*3+2]=.012}
+  if(nebAmt>.002){
+    const drift=ease((t-T_SPACE)/20),hm=ease((t-T_HEART)/T_HEART_D),beat=1+.03*Math.sin(t*2.6)*hm*hm;
+    const amp=1.25*Math.pow(nebAmt,1.3),sz=.17*gh*beat,dsh=.03*drift*Math.sin(t*.07);
+    for(let p=0;p<GW*GH;p++){
+      heartNebula(XA[p]-offx-dsh,YA[p]-offy,sz,hm,t);
+      SP[p*3]+=HN[0]*amp;SP[p*3+1]+=HN[1]*amp;SP[p*3+2]+=HN[2]*amp;
+    }
+  }
+  if(full){IMG.set(SP);PMC.fill(1)}
+  else{
+    eyeScene(t,z,ou,gx,gy,Rp);
+    for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+      let s=0;for(let a=0;a<2;a++)for(let b=0;b<2;b++)s+=PM[(r*2+a)*GW+c*2+b];
+      PMC[r*COLS+c]=s/4;
+    }
+  }
+  bloom(IMG);
+  const fT=ease(t/1.2);
+  for(let p=0;p<GW*GH;p++){
+    const v=(1-.30*ss(.4,1.0,RSA[p]))*fT;
+    for(let k=0;k<3;k++)IMG[p*3+k]=(1-Math.exp(-2*Math.max(0,IMG[p*3+k])))*v;
+  }
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    let r0=0,g0=0,b0=0;
+    for(let a=0;a<2;a++)for(let b=0;b<2;b++){const p=((r*2+a)*GW+c*2+b)*3;r0+=IMG[p];g0+=IMG[p+1];b0+=IMG[p+2]}
+    r0/=4;g0/=4;b0/=4;
+    const o=r*COLS+c,lum=.30*r0+.60*g0+.10*b0,li=Math.pow(clamp(lum),.72);
+    LUM[o]=li;
+    let ri=Math.trunc(clamp((li+(HSC[o]-.5)*.07)*NR,0,NR));
+    if(PMC[o]<.5)ri=Math.max(ri,3);
+    IDX[o]=ri;
+    FG[o*3]=clamp(r0*1.15);FG[o*3+1]=clamp(g0*1.15);FG[o*3+2]=clamp(b0*1.15);
+    VIGC[o]=.25+.75*ss(0,.30*Rps,Rps-RSC[o]);
+  }
+  stampStars(t,gs,starAmt,offx,offy);
+  for(const s of streaks)stampStreak(s);
+  if(!full)stampLashes(z,ou);
+}
+
+// ---------- вывод ----------
+function draw(){
+  const W=canvas.width,H=canvas.height,cw=W/COLS,ch=H/ROWS;
+  ctx.fillStyle='#010203';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.font=`bold ${Math.max(6,Math.min(ch*.82,cw/.56))}px Consolas,"Cascadia Mono","Courier New",monospace`;
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const o=r*COLS+c,i=IDX[o];
+    if(i<=0)continue;
+    const q0=Math.min(QL-1,Math.trunc(clamp(FG[o*3])*(QL-.01))),q1=Math.min(QL-1,Math.trunc(clamp(FG[o*3+1])*(QL-.01))),q2=Math.min(QL-1,Math.trunc(clamp(FG[o*3+2])*(QL-.01)));
+    ctx.fillStyle=`rgb(${q0*255/(QL-1)|0},${q1*255/(QL-1)|0},${q2*255/(QL-1)|0})`;
+    ctx.fillText(RAMP[i],(c+.5)*cw,(r+.5)*ch);
+  }
+  // тонкий хвост кометы/метеоров уже нарисован символами
+}
+function resize(){
+  const dpr=Math.min(devicePixelRatio||1,2),rect=document.getElementById('stage').getBoundingClientRect();
+  canvas.width=Math.max(1,Math.floor(rect.width*dpr));
+  canvas.height=Math.max(1,Math.floor(canvas.width/ASPECT));
+}
+
+let start=performance.now(),paused=false,pauseAt=0,lastDraw=-1e9;
+function frame(now){
+  if(!paused&&now-lastDraw>=1000/FPS-2){
+    lastDraw=now;
+    const t=Math.max(0,(now-start)/1000),dt=Math.min(.1,Math.max(0,t-S.last));
+    renderCells(t,dt);draw();
+  }
+  requestAnimationFrame(frame);
+}
+window.addEventListener('resize',resize);
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'){e.preventDefault();if(!paused){paused=true;pauseAt=performance.now()}else{paused=false;start+=performance.now()-pauseAt}}
+  if(e.key.toLowerCase()==='r'||e.key.toLowerCase()==='к'){reset();start=performance.now();paused=false}
+});
+resize();reset();requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
